@@ -1,3 +1,4 @@
+use core::fmt;
 use std::{
     io,
     sync::{
@@ -15,12 +16,15 @@ use crate::{
     indexes::{PageIndex, PAGE_SIZE},
     page::{self, Page, PageMetadata},
     page_pool::PagePool,
-    tiered::{BudgetExceeded, BudgetPermit, ByteBudget},
+    tiered::{BudgetExceeded, BudgetPermit, ByteBudget, ByteBudgetConfig},
 };
+
+#[cfg(test)]
+use crate::var_len::VarLenMembers;
 
 pub type PageFrameReadGuard = ArcRwLockReadGuard<RawRwLock, Box<Page>>;
 
-pub trait PageBackingStore: Send + Sync + 'static {
+pub trait PageBackingStore: fmt::Debug + Send + Sync + 'static {
     /// Load a [Page] by its content hash from backing storage .
     fn load_page(&self, hash: blake3::Hash) -> Result<Box<Page>, PageIoError>;
 }
@@ -60,13 +64,13 @@ pub enum PageIoError {
     Io(#[from] io::Error),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum PageEvictionPolicy {
     Evictable,
     NeverEvict,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PageSlotHandle {
     slot: Arc<Mutex<PageSlot>>,
 }
@@ -113,6 +117,24 @@ impl PageSlotHandle {
     }
 }
 
+#[cfg(test)]
+impl PageSlotHandle {
+    pub unsafe fn reconstruct_bytes_used_by_rows(
+        &self,
+        fixed_row_size: Size,
+        var_len_visitor: &impl VarLenMembers,
+    ) -> usize {
+        let slot = self.slot.lock().unwrap();
+        unsafe { slot.reconstruct_bytes_used_by_rows(fixed_row_size, var_len_visitor) }
+    }
+
+    pub fn reconstruct_num_rows(&self) -> usize {
+        self.slot.lock().unwrap().reconstruct_num_rows()
+    }
+}
+
+#[derive(Debug)]
+#[allow(unused)]
 pub enum PageSlot {
     Absent,
     Resident {
@@ -186,7 +208,39 @@ impl PageSlot {
     }
 }
 
-#[derive(Clone)]
+#[cfg(test)]
+impl PageSlot {
+    pub unsafe fn reconstruct_bytes_used_by_rows(
+        &self,
+        fixed_row_size: Size,
+        var_len_visitor: &impl VarLenMembers,
+    ) -> usize {
+        match self {
+            PageSlot::Absent => 0,
+            PageSlot::Resident { handle, .. } => {
+                let page = handle.read();
+                unsafe { page.reconstruct_bytes_used_by_rows(fixed_row_size, var_len_visitor) }
+            }
+            PageSlot::NonResident { metadata, .. } => {
+                use crate::var_len::VarLenGranule;
+
+                let fixed_row_bytes = metadata.num_rows as usize + fixed_row_size.len();
+                let var_len_bytes = metadata.available_var_len_granules() * VarLenGranule::SIZE.len();
+                fixed_row_bytes + var_len_bytes
+            }
+        }
+    }
+
+    pub fn reconstruct_num_rows(&self) -> usize {
+        match self {
+            PageSlot::Absent => 0,
+            PageSlot::Resident { handle, .. } => handle.read().reconstruct_num_rows(),
+            PageSlot::NonResident { metadata, .. } => metadata.num_rows as _,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct PageHandle {
     frame: Arc<PageFrame>,
 }
@@ -202,9 +256,10 @@ impl PageHandle {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct PageFrameId(usize);
 
+#[derive(Debug)]
 pub struct PageFrame {
     id: PageFrameId,
     page: Arc<RwLock<Box<Page>>>,
@@ -222,6 +277,8 @@ impl PageFrame {
     }
 }
 
+#[derive(Debug)]
+#[allow(unused)]
 pub enum ResidentPageState {
     Clean { hash: Option<blake3::Hash> },
     Dirty { hash: Option<blake3::Hash> },
@@ -232,6 +289,7 @@ pub struct ReservedPage {
     page: Box<Page>,
 }
 
+#[derive(Debug)]
 pub struct PageManager {
     frames: RwLock<FrameRegistry>,
     pool: PagePool,
@@ -249,6 +307,14 @@ impl PageManager {
             memory,
             access_epoch: <_>::default(),
         }
+    }
+
+    pub fn new_for_test() -> Self {
+        Self::new(
+            PagePool::new_for_test(),
+            Arc::new(()),
+            ByteBudget::new(ByteBudgetConfig::unlimited()).unwrap(),
+        )
     }
 
     pub fn get(
@@ -405,7 +471,7 @@ impl PageManager {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct FrameRegistry {
     frames: Slab<FrameRegistryEntry>,
 }
@@ -434,6 +500,8 @@ impl FrameRegistry {
     }
 }
 
+#[derive(Debug)]
+#[allow(unused)]
 pub struct FrameRegistryEntry {
     frame: Weak<PageFrame>,
     slot: Weak<Mutex<PageSlot>>,
